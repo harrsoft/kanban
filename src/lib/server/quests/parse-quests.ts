@@ -5,13 +5,29 @@
  * under the server vitest project (the repo's test convention) while the
  * script stays a thin CLI wrapper.
  *
- * Parsing convention:
- *   #          = Top-level domain (e.g. "Cognitive enhancements")
- *   ##         = Quest group / board name
- *   ###-###### = Cards / sub-cards (recursive nesting)
+ * ── Parsing convention (rewritten 2026-09-25, the "md half" of the
+ *    `quests-board-convention` loop) ───────────────────────────────────────
  *
- * Special patterns:
- *   - ✅ / 🔄 / 📅  = status markers on headings
+ * The Quests file backs a SINGLE board named "Quests" whose COLUMNS are
+ * statuses. So a `##` section is a *status*, not a board:
+ *
+ *   #           = file title (ignored — the board is always "Quests")
+ *   ##          = STATUS SECTION → a column of the one board
+ *                 canonical: Open · Doing · Done · Not doing
+ *                 legacy aliases still accepted so an un-renamed file parses:
+ *                   "✨ New" → Open, "🏁 Complete" → Done
+ *                 a section that is neither (e.g. "Comments") carries no
+ *                 column and its cards are NOT pushed to the board — it is a
+ *                 side channel, preserved but not board content.
+ *   ###-######  = cards / sub-cards (recursive nesting under the last `###`)
+ *
+ * Before this rewrite a `##` section was a *board name* ("Quests: ✨ New"),
+ * which is exactly why the old importer produced one board per section and
+ * the duplicate boards had to be retired by hand. The section is a status.
+ *
+ * Special patterns (retained):
+ *   - ✅ / 🔄 / 📅  = legacy status markers on headings (still stripped from
+ *     titles; the SECTION now owns a card's column, so the marker is decorative)
  *   - Lines starting with "+" after a heading = description
  */
 
@@ -26,25 +42,19 @@ export interface QuestCard {
 	status: "done" | "in-progress" | "planned" | "info";
 	level: number; // heading depth (3+)
 	children: QuestCard[];
+	section: string; // the `##` section this card was declared under
 }
 
-export interface QuestBoard {
-	id: string;
-	title: string;
-	description: string;
-	status: "active" | "inactive";
+export interface QuestSection {
+	name: string; // raw section title, e.g. "Open" or "✨ New"
+	column: string | null; // canonical column, or null for a non-status section
 	cards: QuestCard[];
-}
-
-export interface QuestDomain {
-	id: string;
-	title: string;
-	boards: QuestBoard[];
 }
 
 export interface QuestData {
 	meta: { created: string; updated: string };
-	domains: QuestDomain[];
+	title: string; // the `#` file title
+	sections: QuestSection[];
 }
 
 export interface KanbanPayload {
@@ -53,6 +63,11 @@ export interface KanbanPayload {
 	columns: string[];
 	cards: { title: string; description: string; column: string }[];
 }
+
+/** The one board this file describes. */
+export const QUESTS_BOARD_NAME = "Quests";
+/** Canonical columns, in display order. */
+export const QUESTS_COLUMNS = ["Open", "Doing", "Done", "Not doing"] as const;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -80,11 +95,39 @@ export function stripStatus(title: string): string {
 
 export function boardColumnForStatus(status: QuestCard["status"]): string {
 	switch (status) {
-		case "done": return "Done";
-		case "in-progress": return "In Progress";
-		case "planned": return "To Do";
-		case "info": return "Info";
+		case "done":
+			return "Done";
+		case "in-progress":
+			return "Doing";
+		case "planned":
+			return "Open";
+		case "info":
+			return "Open";
 	}
+}
+
+/**
+ * sectionToColumn — map a `##` section title to a board column.
+ *
+ * Case-insensitive, emoji-tolerant. Returns `null` for a section that is not a
+ * status (e.g. "Comments") — such a section's cards stay in the file and are
+ * not pushed to the board.
+ */
+export function sectionToColumn(name: string): string | null {
+	const key = stripStatus(name).toLowerCase().trim();
+	const map: Record<string, string> = {
+		// canonical
+		open: "Open",
+		doing: "Doing",
+		done: "Done",
+		"not doing": "Not doing",
+		// legacy aliases (pre-2026-09-25 file shape)
+		"✨ new": "Open",
+		"🏁 complete": "Done",
+		"in progress": "Doing",
+		"to do": "Open",
+	};
+	return map[key] ?? null;
 }
 
 /**
@@ -109,7 +152,10 @@ export function clip(text: string, max = 80): string {
 
 // ─── Parsing ────────────────────────────────────────────────────────────────
 
-function parseDescription(lines: string[], startIdx: number): { description: string; endIdx: number } {
+function parseDescription(
+	lines: string[],
+	startIdx: number,
+): { description: string; endIdx: number } {
 	const descLines: string[] = [];
 	let i = startIdx;
 	while (i < lines.length) {
@@ -145,11 +191,13 @@ export function parseQuestsContent(content: string): QuestData {
 	}
 
 	// Remove any remaining horizontal rule markers (---, ***) that could be mistaken for headings
-	const cleanedLines = lines.filter((l) => !/^---$/.test(l.trim()) && !/^\*\*\*$/.test(l.trim()));
+	const cleanedLines = lines.filter(
+		l => !/^---$/.test(l.trim()) && !/^\*\*\*$/.test(l.trim()),
+	);
 
-	const domains: QuestDomain[] = [];
-	let currentDomain: QuestDomain | null = null;
-	let currentBoard: QuestBoard | null = null;
+	const sections: QuestSection[] = [];
+	let title = "";
+	let currentSection: QuestSection | null = null;
 
 	for (let i = 0; i < cleanedLines.length; i++) {
 		const line = cleanedLines[i];
@@ -158,53 +206,55 @@ export function parseQuestsContent(content: string): QuestData {
 
 		const [_, hashes, rawTitle] = headingMatch;
 		const level = hashes.length;
-		const title = rawTitle.trim();
-		// Status markers apply to boards (level 2) and cards (level 3+). The board
-		// branch below reads `status === "done"`, so it must be computed for level 2
-		// too — otherwise a "✅ board" can never be marked inactive.
-		const status = level >= 2 ? parseStatus(title) : "info";
-		const cleanTitle = level >= 2 ? stripStatus(title) : title;
-
+		const cleanTitle = stripStatus(rawTitle.trim());
 		const { description, endIdx } = parseDescription(cleanedLines, i + 1);
 		i = endIdx - 1; // skip description lines
 
 		if (level === 1) {
-			if (currentDomain) domains.push(currentDomain);
-			currentDomain = { id: slugify(cleanTitle), title: cleanTitle, boards: [] };
-			currentBoard = null;
-		} else if (level === 2) {
-			if (currentBoard && currentDomain) currentDomain.boards.push(currentBoard);
-			currentBoard = {
-				id: slugify(cleanTitle),
-				title: cleanTitle,
-				description,
-				status: status === "done" ? "inactive" : "active",
+			// File title — the board is always "Quests"; keep the title for the
+			// board description. A `#` never becomes a section.
+			if (!title) title = cleanTitle;
+			currentSection = null;
+			continue;
+		}
+
+		if (level === 2) {
+			currentSection = {
+				name: rawTitle.trim(),
+				column: sectionToColumn(rawTitle),
 				cards: [],
 			};
-		} else if (level >= 3 && currentBoard) {
-			const card: QuestCard = {
-				id: slugify(cleanTitle),
-				title: cleanTitle,
-				description,
-				status,
-				level,
-				children: [],
-			};
-			if (level === 3) {
-				currentBoard.cards.push(card);
-			} else if (currentBoard.cards.length > 0) {
-				const parent = currentBoard.cards[currentBoard.cards.length - 1];
-				parent.children.push(card);
-			} else {
-				currentBoard.cards.push(card);
-			}
+			sections.push(currentSection);
+			continue;
+		}
+
+		// level >= 3 → a card. A card before any `##` opens an implicit "Open"
+		// section so a heading-less fragment still parses (and says so).
+		if (!currentSection) {
+			currentSection = { name: "Open", column: "Open", cards: [] };
+			sections.push(currentSection);
+		}
+
+		const card: QuestCard = {
+			id: slugify(cleanTitle),
+			title: cleanTitle,
+			description,
+			status: parseStatus(rawTitle),
+			level,
+			children: [],
+			section: currentSection.name,
+		};
+		if (level === 3) {
+			currentSection.cards.push(card);
+		} else if (currentSection.cards.length > 0) {
+			const parent = currentSection.cards[currentSection.cards.length - 1];
+			parent.children.push(card);
+		} else {
+			currentSection.cards.push(card);
 		}
 	}
 
-	if (currentBoard && currentDomain) currentDomain.boards.push(currentBoard);
-	if (currentDomain) domains.push(currentDomain);
-
-	return { meta, domains };
+	return { meta, title: title || QUESTS_BOARD_NAME, sections };
 }
 
 export function parseQuestsFile(filePath: string): QuestData {
@@ -213,30 +263,41 @@ export function parseQuestsFile(filePath: string): QuestData {
 
 // ─── Kanban payloads ────────────────────────────────────────────────────────
 
+/**
+ * questsToKanbanPayloads — collapse the file into a SINGLE "Quests" board.
+ *
+ * Sections carry the column; a card's own ✅/🔄/📅 marker no longer chooses a
+ * column (the board owns status, and on import the section IS the status).
+ * Non-status sections (column === null) are skipped — their text stays in the
+ * file, untouched.
+ */
 export function questsToKanbanPayloads(data: QuestData): KanbanPayload[] {
-	const payloads: KanbanPayload[] = [];
+	const cards: KanbanPayload["cards"] = [];
 
-	for (const domain of data.domains) {
-		for (const board of domain.boards) {
-			const cards = board.cards.map((c) => ({
+	for (const section of data.sections) {
+		if (!section.column) continue; // e.g. "Comments" — not board content
+		for (const c of section.cards) {
+			cards.push({
 				title: c.title,
 				description:
 					c.description +
-					(c.children.length > 0
-						? "\n\n**Sub-items:**\n" +
-							c.children.map((ch) => `- ${ch.title}: ${clip(ch.description)}`).join("\n")
-						: ""),
-				column: boardColumnForStatus(c.status),
-			}));
-
-			payloads.push({
-				name: `Quests: ${board.title}`,
-				description: `From Quests.md (${domain.title}) — ${board.description || board.title}`,
-				columns: ["To Do", "In Progress", "Done", "Info"],
-				cards,
+					(c.children.length > 0 ?
+						"\n\n**Sub-items:**\n" +
+						c.children
+							.map(ch => `- ${ch.title}: ${clip(ch.description)}`)
+							.join("\n")
+					:	""),
+				column: section.column,
 			});
 		}
 	}
 
-	return payloads;
+	return [
+		{
+			name: QUESTS_BOARD_NAME,
+			description: `From Quests.md — ${data.title}`,
+			columns: [...QUESTS_COLUMNS],
+			cards,
+		},
+	];
 }

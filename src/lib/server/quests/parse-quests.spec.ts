@@ -8,34 +8,45 @@ import {
 	stripStatus,
 	clip,
 	boardColumnForStatus,
+	sectionToColumn,
 	parseQuestsContent,
 	parseQuestsFile,
 	questsToKanbanPayloads,
 } from "./parse-quests";
 
+// The post-2026-09-25 shape: `##` = a status/column of the single "Quests" board.
 const SAMPLE = `---
 created: 2026-01-01
 updated: 2026-08-31
 ---
 
-# Cognitive enhancements
+# 🚀 Quests 🛸
 
-## Reading list
-+ Quests about reading.
+## Open
+
+### 🧠 Cognitive enhancements
++ Quests about thinking.
+
+#### 🥱 Rest
+Ongoing rest work.
+
+### 🌐 Magnova
+Overview line.
+
+## Doing
+
+### 🔄 Deep dive
+A running quest.
+
+## Done
 
 ### ✅ Finish TNG
 Description line one.
 + plus-prefixed description
 
-### 🔄 Deep dive
-A running quest.
+## Comments
 
-## Memory work
-
-### 📅 Spaced repetition
-
-#### Nested bit
-sub description
+🐐→🐺: a side channel, not board content.
 `;
 
 describe("parse-quests helpers", () => {
@@ -55,11 +66,30 @@ describe("parse-quests helpers", () => {
 		expect(stripStatus("Finish ✅ TNG")).toBe("Finish ✅ TNG");
 	});
 
-	it("boardColumnForStatus covers every status", () => {
+	it("boardColumnForStatus maps to the canonical columns", () => {
 		expect(boardColumnForStatus("done")).toBe("Done");
-		expect(boardColumnForStatus("in-progress")).toBe("In Progress");
-		expect(boardColumnForStatus("planned")).toBe("To Do");
-		expect(boardColumnForStatus("info")).toBe("Info");
+		expect(boardColumnForStatus("in-progress")).toBe("Doing");
+		expect(boardColumnForStatus("planned")).toBe("Open");
+		expect(boardColumnForStatus("info")).toBe("Open");
+	});
+});
+
+describe("sectionToColumn", () => {
+	it("maps canonical sections, case-insensitively", () => {
+		expect(sectionToColumn("Open")).toBe("Open");
+		expect(sectionToColumn("doing")).toBe("Doing");
+		expect(sectionToColumn("DONE")).toBe("Done");
+		expect(sectionToColumn("Not doing")).toBe("Not doing");
+	});
+
+	it("accepts the legacy emoji sections", () => {
+		expect(sectionToColumn("✨ New")).toBe("Open");
+		expect(sectionToColumn("🏁 Complete")).toBe("Done");
+	});
+
+	it("returns null for a non-status section", () => {
+		expect(sectionToColumn("Comments")).toBeNull();
+		expect(sectionToColumn("Notes to self")).toBeNull();
 	});
 });
 
@@ -90,53 +120,89 @@ describe("clip — surrogate-safe truncation", () => {
 });
 
 describe("parseQuestsContent", () => {
-	it("parses frontmatter, domains, boards and cards", () => {
+	it("parses frontmatter, the title, sections and cards", () => {
 		const data = parseQuestsContent(SAMPLE);
 		expect(data.meta.created).toBe("2026-01-01");
 		expect(data.meta.updated).toBe("2026-08-31");
-		expect(data.domains).toHaveLength(1);
-		const domain = data.domains[0];
-		expect(domain.title).toBe("Cognitive enhancements");
-		expect(domain.boards.length).toBe(2);
-
-		const board = domain.boards[0];
-		expect(board.title).toBe("Reading list");
-		expect(board.status).toBe("active");
-		expect(board.cards.map((c) => c.title)).toEqual(["Finish TNG", "Deep dive"]);
-		expect(board.cards[0].status).toBe("done");
-		expect(board.cards[1].status).toBe("in-progress");
-		// "+" lines become description; bare lines too.
-		expect(board.cards[0].description).toContain("Description line one.");
-		expect(board.cards[0].description).toContain("plus-prefixed description");
+		expect(data.title).toBe("🚀 Quests 🛸");
+		expect(data.sections.map(s => s.name)).toEqual([
+			"Open",
+			"Doing",
+			"Done",
+			"Comments",
+		]);
+		expect(data.sections.map(s => s.column)).toEqual([
+			"Open",
+			"Doing",
+			"Done",
+			null,
+		]);
 	});
 
-	it("marks a done board inactive", () => {
-		const data = parseQuestsContent("# D\n## ✅ Finished board\n### ✅ card\n");
-		expect(data.domains[0].boards[0].status).toBe("inactive");
+	it("carries each card's column from its section, and strips legacy markers", () => {
+		const data = parseQuestsContent(SAMPLE);
+		const open = data.sections[0];
+		expect(open.cards.map(c => c.title)).toEqual([
+			"🧠 Cognitive enhancements",
+			"🌐 Magnova",
+		]);
+		expect(open.cards[0].section).toBe("Open");
+		const doing = data.sections[1];
+		expect(doing.cards[0].title).toBe("Deep dive");
+		expect(doing.cards[0].status).toBe("in-progress");
+		const done = data.sections[2];
+		expect(done.cards[0].title).toBe("Finish TNG");
+		expect(done.cards[0].status).toBe("done");
+		// "+" lines become description; bare lines too.
+		expect(done.cards[0].description).toContain("Description line one.");
+		expect(done.cards[0].description).toContain("plus-prefixed description");
 	});
 
 	it("nests level-4 cards under the most recent level-3 card", () => {
 		const data = parseQuestsContent(SAMPLE);
-		const board = data.domains[0].boards[1]; // Memory work
-		expect(board.cards).toHaveLength(1);
-		expect(board.cards[0].title).toBe("Spaced repetition");
-		expect(board.cards[0].children.map((c) => c.title)).toEqual(["Nested bit"]);
+		const open = data.sections[0];
+		expect(open.cards[0].children.map(c => c.title)).toEqual(["🥱 Rest"]);
+	});
+
+	it("accepts the legacy emoji sections", () => {
+		const data = parseQuestsContent(
+			"# D\n## ✨ New\n### a\n## 🏁 Complete\n### b\n",
+		);
+		expect(data.sections.map(s => s.column)).toEqual(["Open", "Done"]);
+	});
+
+	it("opens an implicit Open section for a card before any `##`", () => {
+		const data = parseQuestsContent("# D\n### orphan\n");
+		expect(data.sections).toHaveLength(1);
+		expect(data.sections[0].column).toBe("Open");
+		expect(data.sections[0].cards[0].title).toBe("orphan");
 	});
 });
 
 describe("questsToKanbanPayloads", () => {
-	it("produces one board per board, with column placement", () => {
-		const data = parseQuestsContent(SAMPLE);
-		const payloads = questsToKanbanPayloads(data);
-		expect(payloads.map((p) => p.name)).toEqual(["Quests: Reading list", "Quests: Memory work"]);
-		const reading = payloads[0];
-		expect(reading.cards[0].column).toBe("Done");
-		expect(reading.cards[1].column).toBe("In Progress");
+	it("produces ONE board named Quests with the canonical columns", () => {
+		const payloads = questsToKanbanPayloads(parseQuestsContent(SAMPLE));
+		expect(payloads).toHaveLength(1);
+		expect(payloads[0].name).toBe("Quests");
+		expect(payloads[0].columns).toEqual(["Open", "Doing", "Done", "Not doing"]);
+	});
+
+	it("places each card in its section's column and skips non-status sections", () => {
+		const payloads = questsToKanbanPayloads(parseQuestsContent(SAMPLE));
+		const byTitle = Object.fromEntries(
+			payloads[0].cards.map(c => [c.title, c.column]),
+		);
+		expect(byTitle["🧠 Cognitive enhancements"]).toBe("Open");
+		expect(byTitle["🌐 Magnova"]).toBe("Open");
+		expect(byTitle["Deep dive"]).toBe("Doing");
+		expect(byTitle["Finish TNG"]).toBe("Done");
+		// the Comments section contributes no cards
+		expect(payloads[0].cards).toHaveLength(4);
 	});
 
 	it("renders sub-items and clips them surrogate-safely", () => {
 		const long = "⚠️ " + "y".repeat(200);
-		const data = parseQuestsContent(`# D\n## B\n### P\n#### c\n${long}\n`);
+		const data = parseQuestsContent(`# D\n## Open\n### P\n#### c\n${long}\n`);
 		const payloads = questsToKanbanPayloads(data);
 		const desc = payloads[0].cards[0].description;
 		expect(desc).toContain("**Sub-items:**");
@@ -156,8 +222,8 @@ describe("parseQuestsFile", () => {
 	it("reads and parses from disk", () => {
 		const dir = mkdtempSync(join(tmpdir(), "quests-"));
 		const p = join(dir, "Quests.md");
-		writeFileSync(p, "# Domain\n## Board\n### Card\n");
+		writeFileSync(p, "# Quests\n## Open\n### Card\n");
 		const data = parseQuestsFile(p);
-		expect(data.domains[0].boards[0].cards[0].title).toBe("Card");
+		expect(data.sections[0].cards[0].title).toBe("Card");
 	});
 });

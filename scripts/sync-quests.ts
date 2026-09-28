@@ -3,8 +3,9 @@
  * sync-quests.ts — Quests.md → Kanban Sync Tool (MVP)
  *
  * Reads agent-sharing/Quests.md (Lavra's quest list) via the pure parser in
- * src/lib/server/quests/parse-quests.ts and pushes boards/cards to the
- * kanban HTTP API.
+ * src/lib/server/quests/parse-quests.ts and pushes the SINGLE "Quests" board
+ * to the kanban HTTP API. `##` sections are statuses/columns (Open·Doing·Done·
+ * Not doing); a non-status section (e.g. "Comments") is not board content.
  *
  * Usage:
  *   bun run scripts/sync-quests.ts                      # parse & print JSON
@@ -23,6 +24,11 @@
  * NOT YET: a true upsert. This tool is create-only; a real upsert (update existing
  * cards by title) needs a card-update endpoint on the API, which does not exist yet.
  * Board-level dedup is the safeguard in the meantime. Open loop: quests-importer-upsert.
+ *
+ * 2026-09-25: the md half of `quests-board-convention` landed — the parser now maps
+ * `##` sections to COLUMNS of one board (was: one board per section, the bug that
+ * produced the duplicate boards) and `agent-sharing/Quests.md` was renamed to match
+ * (`## ✨ New`→`## Open`, `## 🏁 Complete`→`## Done`, + empty Doing/Not doing).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -132,7 +138,7 @@ async function main() {
 	const questsPath = resolveQuestsPath();
 	console.error("📖 Parsing:", questsPath);
 	const data: QuestData = parseQuestsFile(questsPath);
-	console.error(`  → ${data.domains.length} domains, ${data.domains.reduce((s, d) => s + d.boards.length, 0)} boards`);
+	console.error(`  → 1 board "Quests", ${data.sections.length} sections (${data.sections.filter((s) => s.column).map((s) => `${s.name}→${s.column}`).join(", ")}), ${data.sections.reduce((s, sec) => s + sec.cards.length, 0)} cards`);
 
 	if (!apply) {
 		console.log(JSON.stringify(data, null, 2));

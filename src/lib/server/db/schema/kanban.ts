@@ -3,7 +3,17 @@ import { relations } from "drizzle-orm";
 import { projects } from "./projects";
 import { users } from "./users";
 import { id, timestamps, unix } from "./util";
-import { BoardId, CardAssigneeId, CardCommentId, CardId, ColumnId, LabelId, CardLabelId, ProjectId, UserId } from "../../../types"; // drizzle-kit can't handle path aliases
+import {
+	BoardId,
+	CardAssigneeId,
+	CardCommentId,
+	CardId,
+	ColumnId,
+	LabelId,
+	CardLabelId,
+	ProjectId,
+	UserId,
+} from "../../../types"; // drizzle-kit can't handle path aliases
 
 export const boards = t.pgTable("boards", {
 	id: id().primaryKey().$type<BoardId>(),
@@ -15,6 +25,16 @@ export const boards = t.pgTable("boards", {
 	name: t.text("name").notNull(),
 	description: t.text("description"),
 	archived: t.boolean("archived").notNull().default(false),
+	// Recursive boards: a board may hang off the *card that spawned it* — a quest
+	// or project that opens into its own workspace. A board with a parent is a
+	// nested board, hidden from the top-level boards lists; depth is arbitrary and
+	// bounded by the sync (depth cap + cycle check), not by the schema. `set null`
+	// so deleting the spawning card detaches the sub-board rather than destroying it.
+	parentCardId: t
+		.text("parent_card_id")
+		// Explicit return type breaks the inference cycle boards -> cards -> columns -> boards.
+		.references((): t.AnyPgColumn => cards.id, { onDelete: "set null" })
+		.$type<CardId>(),
 	...timestamps,
 });
 
@@ -173,4 +193,3 @@ export const cardLabelsRelations = relations(cardLabels, ({ one }) => ({
 		references: [labels.id],
 	}),
 }));
-

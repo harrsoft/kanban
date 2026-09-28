@@ -1,0 +1,2 @@
+ALTER TABLE "boards" ADD COLUMN "parent_card_id" text;--> statement-breakpoint
+ALTER TABLE "boards" ADD CONSTRAINT "boards_parent_card_id_cards_id_fk" FOREIGN KEY ("parent_card_id") REFERENCES "public"."cards"("id") ON DELETE set null ON UPDATE no action;

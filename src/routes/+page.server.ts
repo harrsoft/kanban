@@ -1,14 +1,25 @@
 import { error, redirect } from "@sveltejs/kit";
-import { eq, sql, and, desc } from "drizzle-orm";
+import { eq, sql, and, desc, isNull } from "drizzle-orm";
 import * as df from "date-fns";
 import type { Actions } from "./$types";
-import db, { projects as projectsTable, projectMembers, boards, columns, timeclocks } from "$db";
+import db, {
+	projects as projectsTable,
+	projectMembers,
+	boards,
+	columns,
+	timeclocks,
+} from "$db";
 import { ProjectId, Timeclock } from "$lib/types";
 
 export async function load(event) {
 	const session = event.locals.session;
 	if (!session) {
-		return { session: null, projects: [], activeProject: null, recentTimeEntries: [] };
+		return {
+			session: null,
+			projects: [],
+			activeProject: null,
+			recentTimeEntries: [],
+		};
 	}
 
 	// Get user's projects with member counts
@@ -31,7 +42,7 @@ export async function load(event) {
 	}
 
 	// Get board counts per project
-	const userProjectIds = userProjectRows.map((p) => p.id);
+	const userProjectIds = userProjectRows.map(p => p.id);
 
 	const boardCounts = await db
 		.select({
@@ -39,7 +50,12 @@ export async function load(event) {
 			count: sql<number>`cast(count(*) as int)`,
 		})
 		.from(boards)
-		.where(sql`${boards.projectId} in ${userProjectIds}`)
+		.where(
+			and(
+				sql`${boards.projectId} in ${userProjectIds}`,
+				isNull(boards.parentCardId),
+			),
+		)
 		.groupBy(boards.projectId);
 
 	const boardCountMap: Record<string, number> = {};
@@ -69,11 +85,11 @@ export async function load(event) {
 		| ProjectId
 		| undefined;
 	const activeProject =
-		activeProjectId && userProjectRows.some((p) => p.id === activeProjectId)
-			? (userProjectRows.find((p) => p.id === activeProjectId) ?? null)
-			: null;
+		activeProjectId && userProjectRows.some(p => p.id === activeProjectId) ?
+			(userProjectRows.find(p => p.id === activeProjectId) ?? null)
+		:	null;
 
-	const projectList = userProjectRows.map((p) => ({
+	const projectList = userProjectRows.map(p => ({
 		id: p.id,
 		name: p.name,
 		imageUrl: p.imageUrl,

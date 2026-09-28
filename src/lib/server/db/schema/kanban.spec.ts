@@ -35,6 +35,13 @@ describe("boards table", () => {
 		expect(boards.projectId).toBeDefined();
 		expect((boards.projectId as any).columnType).toBe("PgText");
 	});
+
+	it("has a nullable parentCardId for recursive (nested) boards", () => {
+		expect(boards.parentCardId).toBeDefined();
+		expect((boards.parentCardId as any).columnType).toBe("PgText");
+		// Top-level boards have no parent; nested boards point at the spawning card.
+		expect((boards.parentCardId as any).notNull).toBeFalsy();
+	});
 });
 
 describe("columns table", () => {

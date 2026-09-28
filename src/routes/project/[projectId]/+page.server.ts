@@ -1,7 +1,7 @@
 import { error } from "@sveltejs/kit";
 import db from "$db";
 import { projects, boards, columns, cards } from "$db/schema";
-import { eq, sql, asc, and } from "drizzle-orm";
+import { eq, sql, asc, and, isNull } from "drizzle-orm";
 import { BoardId, ProjectId } from "$types/ids";
 import type { PageServerLoad, Actions } from "./$types";
 
@@ -31,21 +31,27 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 		.from(boards)
 		.leftJoin(columns, eq(columns.boardId, boards.id))
 		.leftJoin(cards, eq(cards.columnId, columns.id))
-		.where(and(
-			eq(boards.projectId, projectId),
-			eq(boards.archived, false),
-		))
-		.groupBy(boards.id, boards.name, boards.description, boards.createdAt, boards.updatedAt)
+		.where(
+			and(
+				eq(boards.projectId, projectId),
+				eq(boards.archived, false),
+				isNull(boards.parentCardId), // nested boards are reached through their spawning card, not the top-level list
+			),
+		)
+		.groupBy(
+			boards.id,
+			boards.name,
+			boards.description,
+			boards.createdAt,
+			boards.updatedAt,
+		)
 		.orderBy(asc(boards.createdAt));
 
 	// Fetch archived board count for this project
 	const archivedResult = await db
 		.select({ count: sql<number>`count(*)` })
 		.from(boards)
-		.where(and(
-			eq(boards.projectId, projectId),
-			eq(boards.archived, true),
-		));
+		.where(and(eq(boards.projectId, projectId), eq(boards.archived, true)));
 
 	return {
 		boards: projectBoards,
@@ -56,22 +62,25 @@ export const load: PageServerLoad = async ({ params, locals }) => {
 export const actions: Actions = {
 	updateProject: async ({ request, params }) => {
 		const data = await request.formData();
-		const name = (data.get("name") as string || "").trim();
+		const name = ((data.get("name") as string) || "").trim();
 
 		if (!name) return { error: "Project name is required" };
 
-		await db.update(projects).set({
-			name,
-			updatedAt: Math.floor(Date.now() / 1000),
-		}).where(eq(projects.id, params.projectId as ProjectId));
+		await db
+			.update(projects)
+			.set({
+				name,
+				updatedAt: Math.floor(Date.now() / 1000),
+			})
+			.where(eq(projects.id, params.projectId as ProjectId));
 
 		return { success: true };
 	},
 
 	createBoard: async ({ request, params }) => {
 		const data = await request.formData();
-		const name = (data.get("name") as string || "").trim();
-		const description = (data.get("description") as string || "").trim();
+		const name = ((data.get("name") as string) || "").trim();
+		const description = ((data.get("description") as string) || "").trim();
 
 		if (!name) return { error: "Board name is required" };
 

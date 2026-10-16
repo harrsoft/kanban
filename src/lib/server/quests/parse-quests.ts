@@ -36,7 +36,12 @@ import { readFileSync } from "node:fs";
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface QuestCard {
+	/** The stable key the sync upserts by. Read from `<!-- quest-id: … -->` when the
+	 *  md carries it; otherwise derived from the title (`slugify` + a collision
+	 *  suffix). See `parseQuestIdMarker` / `resolveQuestIds`. */
 	id: string;
+	/** Where `id` came from: a human/md-authored marker, or a derived fallback. */
+	idSource: "marker" | "slug";
 	title: string;
 	description: string;
 	status: "done" | "in-progress" | "planned" | "info";
@@ -61,7 +66,13 @@ export interface KanbanPayload {
 	name: string;
 	description: string;
 	columns: string[];
-	cards: { title: string; description: string; column: string }[];
+	cards: {
+		/** The stable key (md-owned) the sync upserts by. */
+		id: string;
+		title: string;
+		description: string;
+		column: string;
+	}[];
 }
 
 /** The one board this file describes. */
@@ -79,11 +90,66 @@ export function slugify(text: string): string {
 		.slice(0, 64);
 }
 
+/**
+ * The stable-id marker syntax (2026-10-16, the sync's identity carrier):
+ *
+ *   ### 🧠 Cognitive enhancements
+ *   <!-- quest-id: cognitive-enhancements -->
+ *
+ * An HTML comment, so it is invisible in every markdown renderer (GitHub
+ * included) and reads exactly as it looks to a human; but git-versioned and
+ * diff-stable, so a rename of the heading is a rename of the *quest*, not the
+ * birth of a new one. The md owns the id; the board only ever reads it.
+ */
+export const QUEST_ID_RE = /<!--\s*quest-id:\s*([A-Za-z0-9._-]+)\s*-->/;
+
+/** If `line` is a quest-id marker, return its id; else null. */
+export function parseQuestIdMarker(line: string): string | null {
+	const m = line.match(QUEST_ID_RE);
+	return m ? m[1] : null;
+}
+
+/** Render the marker line for an id (the one-time minting pass writes this). */
+export function questIdMarker(id: string): string {
+	return `<!-- quest-id: ${id} -->`;
+}
+
 export function parseStatus(title: string): QuestCard["status"] {
 	if (title.includes("✅")) return "done";
 	if (title.includes("🔄")) return "in-progress";
 	if (title.includes("📅")) return "planned";
 	return "info";
+}
+
+/**
+ * resolveQuestIds — assign every card a unique, stable id *within its section*.
+ *
+ * A card keeps the id its `<!-- quest-id: … -->` marker carries. A card with no
+ * marker falls back to `slugify(title)`. Either way the id must be unique inside
+ * the section it lives in (the sync upserts by id, so two cards sharing one id is
+ * the one failure that would silently merge two quests); a collision gets a
+ * `-2`, `-3`, … suffix, deterministically by document order.
+ *
+ * A duplicated *explicit* marker is the same failure and is named by suffixing
+ * the later one — never silently dropped, because the whole point of the marker
+ * is that the human can see and fix it in the file.
+ */
+export function resolveQuestIds(section: QuestSection): void {
+	const used = new Set<string>();
+	for (const card of section.cards) {
+		assignId(card, used);
+	}
+}
+
+function assignId(card: QuestCard, used: Set<string>): void {
+	const base =
+		card.idSource === "marker" ? card.id : slugify(card.title) || "quest";
+	let id = base;
+	let n = 2;
+	while (used.has(id)) id = `${base}-${n++}`;
+	used.add(id);
+	card.id = id;
+	for (const child of card.children) assignId(child, used);
 }
 
 export function stripStatus(title: string): string {
@@ -155,12 +221,21 @@ export function clip(text: string, max = 80): string {
 function parseDescription(
 	lines: string[],
 	startIdx: number,
-): { description: string; endIdx: number } {
+): { description: string; endIdx: number; questId: string | null } {
 	const descLines: string[] = [];
+	let questId: string | null = null;
 	let i = startIdx;
 	while (i < lines.length) {
 		const line = lines[i].trim();
 		if (line === "" || line.startsWith("#")) break;
+		// A quest-id marker is metadata, not description — capture it and keep it
+		// out of the prose (it must not render inside the card body).
+		const marker = parseQuestIdMarker(line);
+		if (marker !== null) {
+			if (questId === null) questId = marker;
+			i++;
+			continue;
+		}
 		if (line.startsWith("+")) {
 			descLines.push(line.slice(1).trim());
 		} else if (!line.startsWith("-") && !line.startsWith("|")) {
@@ -168,7 +243,7 @@ function parseDescription(
 		}
 		i++;
 	}
-	return { description: descLines.join("\n"), endIdx: i };
+	return { description: descLines.join("\n"), endIdx: i, questId };
 }
 
 export function parseQuestsContent(content: string): QuestData {
@@ -207,7 +282,10 @@ export function parseQuestsContent(content: string): QuestData {
 		const [_, hashes, rawTitle] = headingMatch;
 		const level = hashes.length;
 		const cleanTitle = stripStatus(rawTitle.trim());
-		const { description, endIdx } = parseDescription(cleanedLines, i + 1);
+		const { description, endIdx, questId } = parseDescription(
+			cleanedLines,
+			i + 1,
+		);
 		i = endIdx - 1; // skip description lines
 
 		if (level === 1) {
@@ -236,7 +314,10 @@ export function parseQuestsContent(content: string): QuestData {
 		}
 
 		const card: QuestCard = {
-			id: slugify(cleanTitle),
+			// Provisional; `resolveQuestIds` finalizes uniqueness within the section
+			// once the section is complete (see below).
+			id: questId ?? slugify(cleanTitle),
+			idSource: questId !== null ? "marker" : "slug",
 			title: cleanTitle,
 			description,
 			status: parseStatus(rawTitle),
@@ -253,6 +334,9 @@ export function parseQuestsContent(content: string): QuestData {
 			currentSection.cards.push(card);
 		}
 	}
+
+	// Finalize ids: unique within each section, marker-authoritative.
+	for (const section of sections) resolveQuestIds(section);
 
 	return { meta, title: title || QUESTS_BOARD_NAME, sections };
 }
@@ -278,6 +362,7 @@ export function questsToKanbanPayloads(data: QuestData): KanbanPayload[] {
 		if (!section.column) continue; // e.g. "Comments" — not board content
 		for (const c of section.cards) {
 			cards.push({
+				id: c.id,
 				title: c.title,
 				description:
 					c.description +

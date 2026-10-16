@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { QuestCard } from "./parse-quests";
 import {
 	slugify,
 	parseStatus,
@@ -12,7 +13,27 @@ import {
 	parseQuestsContent,
 	parseQuestsFile,
 	questsToKanbanPayloads,
+	parseQuestIdMarker,
+	questIdMarker,
+	resolveQuestIds,
 } from "./parse-quests";
+
+function mkCard(
+	id: string,
+	title: string,
+	idSource: QuestCard["idSource"],
+): QuestCard {
+	return {
+		id,
+		idSource,
+		title,
+		description: "",
+		status: "info",
+		level: 3,
+		children: [],
+		section: "Open",
+	};
+}
 
 // The post-2026-09-25 shape: `##` = a status/column of the single "Quests" board.
 const SAMPLE = `---
@@ -225,5 +246,98 @@ describe("parseQuestsFile", () => {
 		writeFileSync(p, "# Quests\n## Open\n### Card\n");
 		const data = parseQuestsFile(p);
 		expect(data.sections[0].cards[0].title).toBe("Card");
+	});
+});
+
+describe("quest-id marker (the sync's stable key)", () => {
+	it("parses a marker line, tolerating spacing", () => {
+		expect(
+			parseQuestIdMarker("<!-- quest-id: cognitive-enhancements -->"),
+		).toBe("cognitive-enhancements");
+		expect(parseQuestIdMarker("<!--quest-id:abc.def_1-->")).toBe("abc.def_1");
+		expect(parseQuestIdMarker("<!-- quest-id: with spaces -->")).toBeNull();
+		expect(parseQuestIdMarker("just prose")).toBeNull();
+	});
+
+	it("round-trips through questIdMarker", () => {
+		expect(parseQuestIdMarker(questIdMarker("mag"))).toBe("mag");
+	});
+
+	it("reads the marker off a card instead of leaking it into the description", () => {
+		const data = parseQuestsContent(
+			"# Quests\n## Open\n### 🧠 Cognitive enhancements\n<!-- quest-id: cog -->\n+ Quests about thinking.\n",
+		);
+		const card = data.sections[0].cards[0];
+		expect(card.id).toBe("cog");
+		expect(card.idSource).toBe("marker");
+		expect(card.description).toBe("Quests about thinking.");
+		expect(card.description).not.toContain("quest-id");
+	});
+
+	it("falls back to a slug id and says so when no marker is present", () => {
+		const data = parseQuestsContent(
+			"# Quests\n## Open\n### 🌐 Magnova\nOverview.\n",
+		);
+		const card = data.sections[0].cards[0];
+		expect(card.id).toBe("magnova");
+		expect(card.idSource).toBe("slug");
+	});
+
+	it("disambiguates two cards that would otherwise share a slug id", () => {
+		const data = parseQuestsContent(
+			"# Quests\n## Open\n### Trust\nA\n### Trust\nB\n",
+		);
+		const cards = data.sections[0].cards;
+		expect(cards[0].id).toBe("trust");
+		expect(cards[1].id).toBe("trust-2");
+	});
+
+	it("disambiguates a duplicated explicit marker by suffixing the later one", () => {
+		const data = parseQuestsContent(
+			"# Q\n## Open\n### A\n<!-- quest-id: dup -->\nx\n### B\n<!-- quest-id: dup -->\ny\n",
+		);
+		const cards = data.sections[0].cards;
+		expect(cards[0].id).toBe("dup");
+		expect(cards[1].id).toBe("dup-2");
+	});
+
+	it("scopes uniqueness per section, not globally", () => {
+		const data = parseQuestsContent(
+			"# Q\n## Open\n### Trust\nx\n## Done\n### Trust\ny\n",
+		);
+		const [open, done] = data.sections;
+		expect(open.cards[0].id).toBe("trust");
+		expect(done.cards[0].id).toBe("trust");
+	});
+
+	it("carries the id (and only the id) into the kanban payload", () => {
+		const data = parseQuestsContent(
+			"# Q\n## Open\n### 🧠 cog\n<!-- quest-id: cog -->\nbody\n",
+		);
+		const payload = questsToKanbanPayloads(data)[0];
+		expect(payload.cards[0].id).toBe("cog");
+	});
+
+	it("resolveQuestIds keeps an existing marker id verbatim", () => {
+		const data = parseQuestsContent(
+			"# Q\n## Open\n### Renamed heading\n<!-- quest-id: original -->\nx\n",
+		);
+		expect(data.sections[0].cards[0].id).toBe("original");
+	});
+
+	it("resolveQuestIds operates on a hand-built section (pure contract)", () => {
+		const section = {
+			name: "Open",
+			column: "Open" as string | null,
+			cards: [
+				mkCard("a", "Same Title", "slug"),
+				mkCard("b", "Same Title", "slug"),
+			],
+		};
+		resolveQuestIds(section);
+		expect(section.cards.map(c => c.id)).toEqual([
+			"same-title",
+			"same-title-2",
+		]);
 	});
 });

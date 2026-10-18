@@ -21,9 +21,26 @@
  *     Now the read must
  *     succeed or the run refuses unless `--force` is passed explicitly.
  *
- * NOT YET: a true upsert. This tool is create-only; a real upsert (update existing
- * cards by title) needs a card-update endpoint on the API, which does not exist yet.
- * Board-level dedup is the safeguard in the meantime. Open loop: quests-importer-upsert.
+ * 2026-10-18 (the board half of quests-board-convention): a REAL upsert, keyed
+ * by the md's own quest id. The plan lives in the pure module
+ * src/lib/server/quests/quest-sync-plan.ts (42 fixtures) and the key syntax in
+ * quest-key.ts: every synced card carries <!-- quest-id: ... --> in its body.
+ *
+ *   text + identity : md -> board (body rewritten when the text differs)
+ *   status          : board -> md (a column disagreement is REPORTED as a steer,
+ *                     never written back into the md by this tool)
+ *   same-field      : REFUSED   (a board text edit that differs from the md is a
+ *                     named conflict; nothing is written for that quest)
+ *   key-less cards  : reported as unrecognised, never adopted by title
+ *   gone from md    : archived on the board (reversible), never deleted
+ *
+ *   bun run scripts/sync-quests.ts --plan            # print the diff, no writes
+ *   bun run scripts/sync-quests.ts --apply           # create + repair bodies
+ *   bun run scripts/sync-quests.ts --apply --check   # plan only; exit 1 on drift
+ *
+ * Honest bound: the description field is preferred as the card body when the API
+ * reports both, because POST /api/kanban/boards stores the import body in
+ * description and leaves content empty on imported cards.
  *
  * 2026-09-25: the md half of `quests-board-convention` landed — the parser now maps
  * `##` sections to COLUMNS of one board (was: one board per section, the bug that
@@ -39,6 +56,12 @@ import {
 	questsToKanbanPayloads,
 	type QuestData,
 } from "../src/lib/server/quests/parse-quests";
+import {
+	mdQuests,
+	planQuestSync,
+	type BoardCard,
+	type SyncPlan,
+} from "../src/lib/server/quests/quest-sync-plan";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -125,6 +148,136 @@ async function fetchExistingBoardNames(): Promise<ExistingBoardsResult> {
 	}
 }
 
+
+// ─── The upsert half: read the board, print the plan, execute it ──────────────
+
+interface BoardRead {
+	ok: boolean;
+	cards: BoardCard[];
+	/** The live Quests board's id — the create endpoint needs it explicitly. */
+	boardId?: string;
+	reason?: string;
+}
+
+/**
+ * Read the live "Quests" board through the agent API.
+ *
+ * The public board endpoints are page/UI routes (they answer HTML), so the agent
+ * API is the only machine-readable door — and it is scoped to this key's project,
+ * which is exactly the board's project. The body is taken as `description ?? content`
+ * because POST /api/kanban/boards stores the import body in description.
+ */
+async function fetchQuestsBoard(): Promise<BoardRead> {
+	try {
+		const res = await fetch(`${KANBAN_BASE}/api/kanban/boards`, {
+			headers: { Authorization: `Bearer ${resolveApiKey()}` },
+		});
+		if (!res.ok) return { ok: false, cards: [], reason: `boards HTTP ${res.status}` };
+		const list = await res.json();
+		const boardsList = Array.isArray(list) ? list : Array.isArray(list?.boards) ? list.boards : [];
+		const quests = boardsList.find((b: { name?: string; archived?: boolean }) => b?.name === "Quests" && !b?.archived);
+		if (!quests?.id) return { ok: false, cards: [], reason: "no live board named Quests" };
+
+		const tRes = await fetch(
+			`${KANBAN_BASE}/api/agent/tasks?board=${encodeURIComponent(quests.id)}&limit=200&includeArchived=true`,
+			{ headers: { Authorization: `Bearer ${resolveApiKey()}` } },
+		);
+		if (!tRes.ok) return { ok: false, cards: [], reason: `tasks HTTP ${tRes.status}` };
+		const body = await tRes.json();
+		const tasks: Array<Record<string, unknown>> = Array.isArray(body?.tasks) ? body.tasks : [];
+
+		const cards: BoardCard[] = [];
+		for (const t of tasks) {
+			const col = t.column as { id?: string; name?: string } | string | undefined;
+			const columnName = typeof col === "string" ? col : (col?.name ?? "");
+			const raw = t as { content?: string; description?: string };
+			cards.push({
+				id: String(t.id),
+				column: columnName,
+				body: (raw.content ?? raw.description ?? "") as string,
+				archived: Boolean(t.archived),
+			});
+		}
+		return { ok: true, cards, boardId: String(quests.id) };
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { ok: false, cards: [], reason: msg };
+	}
+}
+
+function printPlan(plan: SyncPlan): void {
+	const line = (label: string, n: number, sample?: string[]) =>
+		console.error(`  ${label.padEnd(14)} ${String(n).padStart(3)}${sample && sample.length ? `  (${sample.slice(0, 4).join(", ")}${sample.length > 4 ? ", …" : ""})` : ""}`);
+	console.error("=== Quests sync plan ===");
+	line("create", plan.create.length, plan.create.map(c => c.id));
+	line("update body", plan.updateBody.length, plan.updateBody.map(u => u.id));
+	line("steer md", plan.steerMdStatus.length, plan.steerMdStatus.map(s => `${s.id}: ${s.boardColumn}!=${s.mdColumn}`));
+	line("archive", plan.archive.length, plan.archive.map(a => a.id));
+	line("unchanged", plan.unchanged.length);
+	line("unrecognised", plan.unrecognised.length, plan.unrecognised.map(u => u.cardId));
+	line("CONFLICTS", plan.conflicts.length, plan.conflicts.map(c => `${c.id}: ${c.why}`));
+}
+
+/**
+ * Write the plan. Creates go through the agent API (one idempotency key per
+ * quest), body repairs and archives through PATCH. A conflict is never written —
+ * it is printed and left standing, because picking a winner silently is how a
+ * sync eats a human's edit. Status is md-owned: steers are printed, never written.
+ */
+async function executePlan(plan: SyncPlan, questsBoardId: string): Promise<number> {
+	const key = resolveApiKey();
+	let failures = 0;
+
+	for (const c of plan.create) {
+		const res = await fetch(`${KANBAN_BASE}/api/agent/cards`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${key}`,
+				"Idempotency-Key": `quests-create-${c.id}`,
+			},
+			body: JSON.stringify({ boardId: questsBoardId, content: c.body }),
+		});
+		if (!res.ok) {
+			console.error(`  x create ${c.id}: HTTP ${res.status} ${await res.text()}`);
+			failures++;
+		} else {
+			console.error(`  ok create ${c.id}`);
+		}
+	}
+
+	const patches = [
+		...plan.updateBody.map(u => ({ cardId: u.cardId, id: u.id, body: u.body as string | undefined })),
+		...plan.archive.map(a => ({ cardId: a.cardId, id: a.id, body: undefined as string | undefined })),
+	];
+	for (const u of patches) {
+		const payload: Record<string, unknown> = u.body !== undefined ? { content: u.body } : { archived: true };
+		const res = await fetch(`${KANBAN_BASE}/api/agent/cards/${encodeURIComponent(u.cardId)}`, {
+			method: "PATCH",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${key}`,
+				"Idempotency-Key": `quests-patch-${u.id}-${u.body !== undefined ? "body" : "archive"}`,
+			},
+			body: JSON.stringify(payload),
+		});
+		if (!res.ok) {
+			console.error(`  x patch ${u.id}: HTTP ${res.status} ${await res.text()}`);
+			failures++;
+		} else {
+			console.error(`  ok patch ${u.id}`);
+		}
+	}
+
+	for (const s of plan.steerMdStatus) {
+		console.error(`  -> md export owns: ${s.id} is "${s.boardColumn}" on the board, "${s.mdColumn}" in the md`);
+	}
+	for (const c of plan.conflicts) {
+		console.error(`  CONFLICT ${c.id} (card ${c.cardId}): ${c.why} — not written`);
+	}
+	return failures > 0 || plan.conflicts.length > 0 ? 1 : 0;
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -134,20 +287,48 @@ async function main() {
 	const apply = args.includes("--apply");
 	const dryRun = args.includes("--dry-run");
 	const force = args.includes("--force");
+	const planOnly = args.includes("--plan");
+	const checkOnly = args.includes("--check");
 
 	const questsPath = resolveQuestsPath();
 	console.error("📖 Parsing:", questsPath);
 	const data: QuestData = parseQuestsFile(questsPath);
 	console.error(`  → 1 board "Quests", ${data.sections.length} sections (${data.sections.filter((s) => s.column).map((s) => `${s.name}→${s.column}`).join(", ")}), ${data.sections.reduce((s, sec) => s + sec.cards.length, 0)} cards`);
 
-	if (!apply) {
+	const payloads = questsToKanbanPayloads(data);
+
+	if (!apply && !planOnly && !checkOnly) {
 		console.log(JSON.stringify(data, null, 2));
-		console.error("\nTip: Use --apply to create boards in kanban, or --dry-run to preview API calls.");
+		console.error("\nTip: Use --plan to see the board diff, --apply to sync, --dry-run to preview creates.");
 		return;
 	}
 
+	// ── The upsert half (2026-10-18): diff the md against the real board ──────
+	// Runs for --plan / --apply / --check. Reads the board through the agent API
+	// (scoped to this key's project), plans in pure code, and only writes when
+	// --apply was passed AND --check was not.
+	if (planOnly || checkOnly || apply) {
+		const board = await fetchQuestsBoard();
+		if (!board.ok) {
+			console.error(`✗ Could not read the Quests board (${board.reason}); refusing to plan blind.`);
+			process.exit(1);
+		}
+		const plan = planQuestSync(mdQuests(payloads), board.cards);
+		printPlan(plan);
+		if (checkOnly) {
+			const drifted =
+				plan.create.length + plan.updateBody.length + plan.archive.length + plan.conflicts.length > 0;
+			process.exit(drifted ? 1 : 0);
+		}
+		if (!apply || dryRun) {
+			console.error("\n[--plan / --dry-run] nothing written.");
+			return;
+		}
+		const rc = await executePlan(plan, board.boardId ?? "");
+		process.exit(rc);
+	}
+
 	const projectId = resolveProjectId();
-	const payloads = questsToKanbanPayloads(data);
 
 	// Establish existing board names. If we cannot, refuse rather than risk duplicates.
 	const existing = await fetchExistingBoardNames();
